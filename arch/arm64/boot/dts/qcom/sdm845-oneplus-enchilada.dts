@@ -53,7 +53,7 @@
 };
 
 &sound {
-	model = "OnePlus 6";
+	model = "OnePlus6";
 	audio-routing =	"RX_BIAS", "MCLK",
 			"AMIC2", "MIC BIAS2",
 			"AMIC3", "MIC BIAS4",
