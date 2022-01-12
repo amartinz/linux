@@ -54,10 +54,8 @@ struct qcom_spmi_pmic {
 	const char *name;
 };
 
-static inline void qcom_pmic_print_info(struct device *dev, struct qcom_spmi_pmic *pmic)
-{
-	dev_info(dev, "%x: %s v%d.%d\n",
-		pmic->subtype, pmic->name, pmic->major, pmic->minor);
-}
+struct device;
+
+const struct qcom_spmi_pmic* qcom_pmic_get(struct device *dev);
 
 #endif /* __QCOM_PMIC_H__ */

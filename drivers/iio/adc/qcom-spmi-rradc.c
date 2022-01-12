@@ -12,25 +12,23 @@
 #include <linux/iio/types.h>
 #include <linux/kernel.h>
 #include <linux/math64.h>
-#include <linux/minmax.h>
 #include <linux/module.h>
-#include <linux/of.h>
+#include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
-#include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/spmi.h>
 #include <linux/types.h>
 #include <asm-generic/unaligned.h>
 #include <linux/units.h>
-#include <soc/qcom/qcom-pmic.h>
+#include <soc/qcom/qcom-spmi-pmic.h>
 
 #define RR_ADC_EN_CTL 0x46
 #define RR_ADC_SKIN_TEMP_LSB 0x50
 #define RR_ADC_SKIN_TEMP_MSB 0x51
-#define RR_ADC_RR_ADC_CTL 0x52
-#define RR_ADC_ADC_CTL_CONTINUOUS_SEL BIT(3)
-#define RR_ADC_ADC_LOG 0x53
-#define RR_ADC_ADC_LOG_CLR_CTRL BIT(0)
+#define RR_ADC_CTL 0x52
+#define RR_ADC_CTL_CONTINUOUS_SEL BIT(3)
+#define RR_ADC_LOG 0x53
+#define RR_ADC_LOG_CLR_CTRL BIT(0)
 
 #define RR_ADC_FAKE_BATT_LOW_LSB 0x58
 #define RR_ADC_FAKE_BATT_LOW_MSB 0x59
@@ -224,18 +222,22 @@ struct rradc_chip;
  * @scale:		Channel scale callback
  */
 struct rradc_channel {
+	const char *label;
 	u8 lsb;
 	u8 status;
 	int size;
 	int trigger_addr;
 	int trigger_mask;
-	int (*scale)(struct rradc_chip *chip, u16 adc_code, int *result);
+	int offset;
+	int scale;
+	int (*scale_fn)(struct rradc_chip *chip, u16 adc_code, int *result);
 };
 
 struct rradc_chip {
 	struct device *dev;
-	struct qcom_spmi_pmic *pmic;
-	struct mutex lock;
+	const struct qcom_spmi_pmic *pmic;
+	/* Lock held while accessing the rradc registers */
+	struct mutex conversion_lock;
 	struct regmap *regmap;
 	u32 base;
 	int batt_id_delay;
@@ -347,61 +349,6 @@ static int rradc_post_process_batt_id(struct rradc_chip *chip, u16 adc_code,
 	return 0;
 }
 
-static int rradc_post_process_therm(struct rradc_chip *chip, u16 adc_code,
-				    int *result_millidegc)
-{
-	int64_t temp;
-
-	/* K = code/4 */
-	temp = ((int64_t)adc_code * MILLI);
-	temp = div64_s64(temp, RR_ADC_BATT_THERM_LSB_K);
-	*result_millidegc = (int)milli_kelvin_to_millicelsius(temp);
-
-	return 0;
-}
-
-static int rradc_post_process_volt(struct rradc_chip *chip, u16 adc_code,
-				   int *result_uv)
-{
-	int64_t uv;
-
-	/* 8x input attenuation; 2.5V ADC full scale */
-	uv = ((int64_t)adc_code * RR_ADC_VOLT_INPUT_FACTOR);
-	uv *= (RR_ADC_FS_VOLTAGE_MV * MILLI);
-	uv = div64_s64(uv, RR_ADC_CHAN_MAX_VALUE);
-	*result_uv = (int)uv;
-
-	return 0;
-}
-
-static int rradc_post_process_usbin_curr(struct rradc_chip *chip, u16 adc_code,
-					 int *result_ua)
-{
-	int64_t ua;
-
-	/* scale * V/A; 2.5V ADC full scale */
-	ua = ((int64_t)adc_code * RR_ADC_CURR_USBIN_INPUT_FACTOR_MIL);
-	ua *= (RR_ADC_FS_VOLTAGE_MV * MILLI);
-	ua = div64_s64(ua, (RR_ADC_CHAN_MAX_VALUE * 10));
-	*result_ua = (int)ua;
-
-	return 0;
-}
-
-static int rradc_post_process_dcin_curr(struct rradc_chip *chip, u16 adc_code,
-					int *result_ua)
-{
-	int64_t ua;
-
-	/* 0.5 V/A; 2.5V ADC full scale */
-	ua = ((int64_t)adc_code * RR_ADC_CURR_INPUT_FACTOR);
-	ua *= (RR_ADC_FS_VOLTAGE_MV * MILLI);
-	ua = div64_s64(ua, (RR_ADC_CHAN_MAX_VALUE * 1000));
-	*result_ua = (int)ua;
-
-	return 0;
-}
-
 static int rradc_post_process_die_temp(struct rradc_chip *chip, u16 adc_code,
 				       int *result_millidegc)
 {
@@ -442,18 +389,6 @@ static int rradc_post_process_chg_temp_hot(struct rradc_chip *chip,
 	return 0;
 }
 
-static int rradc_post_process_skin_temp_hot(struct rradc_chip *chip,
-					    u16 adc_code, int *result_millidegc)
-{
-	int64_t temp;
-
-	temp = (int64_t)adc_code;
-	temp = (div64_s64(temp, 2) - 30) * MILLI;
-	*result_millidegc = (int)temp;
-
-	return 0;
-}
-
 static int rradc_post_process_chg_temp(struct rradc_chip *chip, u16 adc_code,
 				       int *result_millidegc)
 {
@@ -466,6 +401,15 @@ static int rradc_post_process_chg_temp(struct rradc_chip *chip, u16 adc_code,
 		return -EINVAL;
 	}
 
+/*
+	uv = ((int64_t)adc_code * 5000000);
+	uv = uv / (3 * 1024);
+	uv = offset - uv;
+	uv = uv * 1000 / slope;
+	uv += 25000;
+	*result_millidegc = (int)uv;
+*/
+
 	uv = ((int64_t)adc_code * RR_ADC_TEMP_FS_VOLTAGE_NUM);
 	uv = div64_s64(uv,
 		       (RR_ADC_TEMP_FS_VOLTAGE_DEN * RR_ADC_CHAN_MAX_VALUE));
@@ -477,34 +421,20 @@ static int rradc_post_process_chg_temp(struct rradc_chip *chip, u16 adc_code,
 	return 0;
 }
 
-static int rradc_post_process_gpio(struct rradc_chip *chip, u16 adc_code,
-				   int *result_mv)
-{
-	int64_t mv;
-
-	/* 5V ADC full scale, 10 bit */
-	mv = ((int64_t)adc_code * RR_ADC_GPIO_FS_RANGE);
-	mv = div64_s64(mv, RR_ADC_CHAN_MAX_VALUE);
-	*result_mv = (int)mv;
-
-	return 0;
-}
-
 static int rradc_enable_continuous_mode(struct rradc_chip *chip)
 {
 	int ret;
 
 	/* Clear channel log */
-	ret = regmap_update_bits(chip->regmap, chip->base + RR_ADC_ADC_LOG,
-				 RR_ADC_ADC_LOG_CLR_CTRL,
-				 RR_ADC_ADC_LOG_CLR_CTRL);
+	ret = regmap_update_bits(chip->regmap, chip->base + RR_ADC_LOG,
+				 RR_ADC_LOG_CLR_CTRL, RR_ADC_LOG_CLR_CTRL);
 	if (ret < 0) {
 		dev_err(chip->dev, "log ctrl update to clear failed:%d\n", ret);
 		return ret;
 	}
 
-	ret = regmap_update_bits(chip->regmap, chip->base + RR_ADC_ADC_LOG,
-				 RR_ADC_ADC_LOG_CLR_CTRL, 0);
+	ret = regmap_update_bits(chip->regmap, chip->base + RR_ADC_LOG,
+				 RR_ADC_LOG_CLR_CTRL, 0);
 	if (ret < 0) {
 		dev_err(chip->dev, "log ctrl update to not clear failed:%d\n",
 			ret);
@@ -512,9 +442,9 @@ static int rradc_enable_continuous_mode(struct rradc_chip *chip)
 	}
 
 	/* Switch to continuous mode */
-	ret = regmap_update_bits(chip->regmap, chip->base + RR_ADC_RR_ADC_CTL,
-				 RR_ADC_ADC_CTL_CONTINUOUS_SEL,
-				 RR_ADC_ADC_CTL_CONTINUOUS_SEL);
+	ret = regmap_update_bits(chip->regmap, chip->base + RR_ADC_CTL,
+				 RR_ADC_CTL_CONTINUOUS_SEL,
+				 RR_ADC_CTL_CONTINUOUS_SEL);
 	if (ret < 0)
 		dev_err(chip->dev, "Update to continuous mode failed:%d\n",
 			ret);
@@ -527,8 +457,8 @@ static int rradc_disable_continuous_mode(struct rradc_chip *chip)
 	int ret;
 
 	/* Switch to non continuous mode */
-	ret = regmap_update_bits(chip->regmap, chip->base + RR_ADC_RR_ADC_CTL,
-				 RR_ADC_ADC_CTL_CONTINUOUS_SEL, 0);
+	ret = regmap_update_bits(chip->regmap, chip->base + RR_ADC_CTL,
+				 RR_ADC_CTL_CONTINUOUS_SEL, 0);
 	if (ret < 0)
 		dev_err(chip->dev, "Update to non-continuous mode failed:%d\n",
 			ret);
@@ -608,7 +538,7 @@ static int rradc_read_status_in_cont_mode(struct rradc_chip *chip,
 
 disable_trigger:
 	regmap_update_bits(chip->regmap, chip->base + chan->trigger_addr,
-				 chan->trigger_mask, 0);
+			   chan->trigger_mask, 0);
 
 	return ret;
 }
@@ -654,13 +584,12 @@ static int rradc_prepare_batt_id_conversion(struct rradc_chip *chip,
 	/*
 	 * Reset registers back to default values
 	 */
-	regmap_update_bits(chip->regmap,
-				 chip->base + RR_ADC_BATT_ID_TRIGGER,
-				 RR_ADC_TRIGGER_CTL, 0);
+	regmap_update_bits(chip->regmap, chip->base + RR_ADC_BATT_ID_TRIGGER,
+			   RR_ADC_TRIGGER_CTL, 0);
 
 out_disable_batt_id:
 	regmap_update_bits(chip->regmap, chip->base + RR_ADC_BATT_ID_CTRL,
-				 RR_ADC_BATT_ID_CTRL_CHANNEL_CONV, 0);
+			   RR_ADC_BATT_ID_CTRL_CHANNEL_CONV, 0);
 
 	return ret;
 }
@@ -673,7 +602,7 @@ static int rradc_do_conversion(struct rradc_chip *chip,
 	int ret;
 	u8 buf[6];
 
-	mutex_lock(&chip->lock);
+	mutex_lock(&chip->conversion_lock);
 
 	switch (chan_id) {
 	case RR_ADC_BATT_ID:
@@ -755,9 +684,58 @@ static int rradc_do_conversion(struct rradc_chip *chip,
 	}
 
 unlock_out:
-	mutex_unlock(&chip->lock);
+	mutex_unlock(&chip->conversion_lock);
 
 	return ret;
+}
+
+static int rradc_read_scale(struct rradc_chip *chip, int chan_id, int *val,
+			    int *val2)
+{
+	switch (chan_id) {
+	case RR_ADC_BATT_THERM:
+	case RR_ADC_SKIN_TEMP:
+		*val = 250;
+		return IIO_VAL_INT;
+	case RR_ADC_USBIN_I:
+		*val = 14734375;
+		*val2 = 32;
+		return IIO_VAL_FRACTIONAL;
+	case RR_ADC_DCIN_I:
+		*val = 1953125;
+		*val2 = 4;
+		return IIO_VAL_FRACTIONAL;
+	case RR_ADC_USBIN_V:
+	case RR_ADC_DCIN_V:
+		*val = 78125;
+		*val2 = 4;
+		return IIO_VAL_FRACTIONAL;
+	case RR_ADC_GPIO:
+		*val = 5000;
+		*val2 = 1024;
+		return IIO_VAL_FRACTIONAL;
+	case RR_ADC_SKIN_HOT_TEMP:
+	case RR_ADC_SKIN_TOO_HOT_TEMP:
+		*val = 500;
+		return IIO_VAL_INT;
+	default:
+		break;
+	}
+
+	return -EINVAL;
+}
+
+static int rradc_read_offset(struct rradc_chip *chip, int chan_id, int *val)
+{
+	switch (chan_id) {
+	case RR_ADC_SKIN_HOT_TEMP:
+	case RR_ADC_SKIN_TOO_HOT_TEMP:
+		*val = -60;
+		return IIO_VAL_INT;
+	default:
+		break;
+	}
+	return -EINVAL;
 }
 
 static int rradc_read_raw(struct iio_dev *indio_dev,
@@ -769,14 +747,23 @@ static int rradc_read_raw(struct iio_dev *indio_dev,
 	int ret;
 	u16 adc_code;
 
-	if (chan_spec->address >= RR_ADC_CHAN_MAX) {
+	if (chan_spec->channel >= RR_ADC_CHAN_MAX) {
 		dev_err(chip->dev, "Invalid channel index:%ld\n",
-			chan_spec->address);
+			chan_spec->channel);
 		return -EINVAL;
 	}
 
-	chan = &rradc_chans[chan_spec->address];
-	ret = rradc_do_conversion(chip, chan_spec->address, &adc_code);
+	switch (mask) {
+	case IIO_CHAN_INFO_SCALE:
+		return rradc_read_scale(chip, chan_spec->channel, val, val2);
+	case IIO_CHAN_INFO_OFFSET:
+		return rradc_read_offset(chip, chan_spec->channel, val);
+	default:
+		break;
+	}
+
+	chan = &rradc_chans[chan_spec->channel];
+	ret = rradc_do_conversion(chip, chan_spec->channel, &adc_code);
 	if (ret < 0)
 		return ret;
 
@@ -785,20 +772,32 @@ static int rradc_read_raw(struct iio_dev *indio_dev,
 		*val = adc_code;
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_PROCESSED:
-		chan->scale(chip, adc_code, val);
+		if (chan->scale_fn)
+			chan->scale_fn(chip, adc_code, val);
+		else
+			return -EINVAL;
 		return IIO_VAL_INT;
 	default:
 		return -EINVAL;
 	}
 }
 
+static int rradc_read_label(struct iio_dev *indio_dev,
+			 struct iio_chan_spec const *chan,
+			 char *label)
+{
+	return snprintf(label, PAGE_SIZE, "%s\n", rradc_chans[chan->channel].label);
+}
+
 static const struct iio_info rradc_info = {
-	.read_raw = &rradc_read_raw,
+	.read_raw = rradc_read_raw,
+	.read_label = rradc_read_label,
 };
 
 static const struct rradc_channel rradc_chans[RR_ADC_CHAN_MAX] = {
 	{
-		.scale = rradc_post_process_batt_id,
+		.label = "batt_id",
+		.scale_fn = rradc_post_process_batt_id,
 		.lsb = RR_ADC_BATT_ID_5_LSB,
 		.status = RR_ADC_BATT_ID_STS,
 		.size = 6,
@@ -806,28 +805,28 @@ static const struct rradc_channel rradc_chans[RR_ADC_CHAN_MAX] = {
 		.trigger_mask = BIT(0),
 	},
 	{
-		.scale = rradc_post_process_therm,
+		.label = "batt",
 		.lsb = RR_ADC_BATT_THERM_LSB,
 		.status = RR_ADC_BATT_THERM_STS,
 		.size = 2,
 		.trigger_addr = RR_ADC_BATT_THERM_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_therm,
+		.label = "skin",
 		.lsb = RR_ADC_SKIN_TEMP_LSB,
 		.status = RR_ADC_AUX_THERM_STS,
 		.size = 2,
 		.trigger_addr = RR_ADC_AUX_THERM_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_usbin_curr,
+		.label = "iusb",
 		.lsb = RR_ADC_USB_IN_I_LSB,
 		.status = RR_ADC_USB_IN_I_STS,
 		.size = 2,
 		.trigger_addr = RR_ADC_USB_IN_I_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_volt,
+		.label = "vusb",
 		.lsb = RR_ADC_USB_IN_V_LSB,
 		.status = RR_ADC_USB_IN_V_STS,
 		.size = 2,
@@ -835,21 +834,22 @@ static const struct rradc_channel rradc_chans[RR_ADC_CHAN_MAX] = {
 		.trigger_mask = BIT(7),
 	},
 	{
-		.scale = rradc_post_process_dcin_curr,
+		.label = "idc",
 		.lsb = RR_ADC_DC_IN_I_LSB,
 		.status = RR_ADC_DC_IN_I_STS,
 		.size = 2,
 		.trigger_addr = RR_ADC_DC_IN_I_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_volt,
+		.label = "vdc",
 		.lsb = RR_ADC_DC_IN_V_LSB,
 		.status = RR_ADC_DC_IN_V_STS,
 		.size = 2,
 		.trigger_addr = RR_ADC_DC_IN_V_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_die_temp,
+		.label = "die",
+		.scale_fn = rradc_post_process_die_temp,
 		.lsb = RR_ADC_PMI_DIE_TEMP_LSB,
 		.status = RR_ADC_PMI_DIE_TEMP_STS,
 		.size = 2,
@@ -857,42 +857,45 @@ static const struct rradc_channel rradc_chans[RR_ADC_CHAN_MAX] = {
 		.trigger_mask = RR_ADC_TRIGGER_EVERY_CYCLE,
 	},
 	{
-		.scale = rradc_post_process_chg_temp,
+		.label = "chg",
+		.scale_fn = rradc_post_process_chg_temp,
 		.lsb = RR_ADC_CHARGER_TEMP_LSB,
 		.status = RR_ADC_CHARGER_TEMP_STS,
 		.size = 2,
 		.trigger_addr = RR_ADC_CHARGER_TEMP_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_gpio,
+		.label = "gpio",
 		.lsb = RR_ADC_GPIO_LSB,
 		.status = RR_ADC_GPIO_STS,
 		.size = 2,
 		.trigger_addr = RR_ADC_GPIO_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_chg_temp_hot,
+		.label = "chg_hot",
+		.scale_fn = rradc_post_process_chg_temp_hot,
 		.lsb = RR_ADC_CHARGER_HOT,
 		.status = RR_ADC_CHARGER_TEMP_STS,
 		.size = 1,
 		.trigger_addr = RR_ADC_CHARGER_TEMP_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_chg_temp_hot,
+		.label = "chg_too_hot",
+		.scale_fn = rradc_post_process_chg_temp_hot,
 		.lsb = RR_ADC_CHARGER_TOO_HOT,
 		.status = RR_ADC_CHARGER_TEMP_STS,
 		.size = 1,
 		.trigger_addr = RR_ADC_CHARGER_TEMP_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_skin_temp_hot,
+		.label = "skin_hot",
 		.lsb = RR_ADC_SKIN_HOT,
 		.status = RR_ADC_AUX_THERM_STS,
 		.size = 1,
 		.trigger_addr = RR_ADC_AUX_THERM_TRIGGER,
 	},
 	{
-		.scale = rradc_post_process_skin_temp_hot,
+		.label = "skin_too_hot",
 		.lsb = RR_ADC_SKIN_TOO_HOT,
 		.status = RR_ADC_AUX_THERM_STS,
 		.size = 1,
@@ -902,96 +905,89 @@ static const struct rradc_channel rradc_chans[RR_ADC_CHAN_MAX] = {
 
 static const struct iio_chan_spec rradc_iio_chans[RR_ADC_CHAN_MAX] = {
 	{
-		.extend_name = "batt_id",
 		.type = IIO_RESISTANCE,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
-		.address = RR_ADC_BATT_ID,
-	},
-	{
-		.extend_name = "batt_therm",
-		.type = IIO_TEMP,
 		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
-		.address = RR_ADC_BATT_THERM,
+		.channel = RR_ADC_BATT_ID,
 	},
 	{
-		.extend_name = "skin_temp",
 		.type = IIO_TEMP,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED)|
-			     BIT(IIO_CHAN_INFO_RAW),
-		.address = RR_ADC_SKIN_TEMP,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+		.channel = RR_ADC_BATT_THERM,
 	},
 	{
-		.extend_name = "usbin_i",
+		.type = IIO_TEMP,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+		.channel = RR_ADC_SKIN_TEMP,
+	},
+	{
 		.type = IIO_CURRENT,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
-		.address = RR_ADC_USBIN_I,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+		.channel = RR_ADC_USBIN_I,
 	},
 	{
-		.extend_name = "usbin_v",
 		.type = IIO_VOLTAGE,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
-		.address = RR_ADC_USBIN_V,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+		.channel = RR_ADC_USBIN_V,
 	},
 	{
-		.extend_name = "dcin_i",
 		.type = IIO_CURRENT,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
-		.address = RR_ADC_DCIN_I,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+		.channel = RR_ADC_DCIN_I,
 	},
 	{
-		.extend_name = "dcin_v",
 		.type = IIO_VOLTAGE,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
-		.address = RR_ADC_DCIN_V,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+		.channel = RR_ADC_DCIN_V,
 	},
 	{
-		.extend_name = "die_temp",
 		.type = IIO_TEMP,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED)|
-			     BIT(IIO_CHAN_INFO_RAW),
-		.address = RR_ADC_DIE_TEMP,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_PROCESSED) | BIT(IIO_CHAN_INFO_RAW),
+		.channel = RR_ADC_DIE_TEMP,
 	},
 	{
-		.extend_name = "chg_temp",
 		.type = IIO_TEMP,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED)|
-			     BIT(IIO_CHAN_INFO_RAW),
-		.address = RR_ADC_CHG_TEMP,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_PROCESSED) | BIT(IIO_CHAN_INFO_RAW),
+		.channel = RR_ADC_CHG_TEMP,
 	},
 	{
-		.extend_name = "gpio",
 		.type = IIO_VOLTAGE,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED)|
-			     BIT(IIO_CHAN_INFO_RAW),
-		.address = RR_ADC_GPIO,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+		.channel = RR_ADC_GPIO,
 	},
 	{
-		.extend_name = "chg_temp_hot",
 		.type = IIO_TEMP,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED)|
-			     BIT(IIO_CHAN_INFO_RAW),
-		.address = RR_ADC_CHG_HOT_TEMP,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_PROCESSED) | BIT(IIO_CHAN_INFO_RAW),
+		.channel = RR_ADC_CHG_HOT_TEMP,
 	},
 	{
-		.extend_name = "chg_temp_too_hot",
 		.type = IIO_TEMP,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED)|
-			     BIT(IIO_CHAN_INFO_RAW),
-		.address = RR_ADC_CHG_TOO_HOT_TEMP,
+		.info_mask_separate =
+			BIT(IIO_CHAN_INFO_PROCESSED) | BIT(IIO_CHAN_INFO_RAW),
+		.channel = RR_ADC_CHG_TOO_HOT_TEMP,
 	},
 	{
-		.extend_name = "skin_temp_hot",
 		.type = IIO_TEMP,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED)|
-			     BIT(IIO_CHAN_INFO_RAW),
-		.address = RR_ADC_SKIN_TEMP,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
+				      BIT(IIO_CHAN_INFO_SCALE) |
+				      BIT(IIO_CHAN_INFO_OFFSET),
+		.channel = RR_ADC_SKIN_TEMP,
 	},
 	{
-		.extend_name = "skin_temp_too_hot",
 		.type = IIO_TEMP,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED)|
-			     BIT(IIO_CHAN_INFO_RAW),
-		.address = RR_ADC_SKIN_TEMP,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
+				      BIT(IIO_CHAN_INFO_SCALE) |
+				      BIT(IIO_CHAN_INFO_OFFSET),
+		.channel = RR_ADC_SKIN_TEMP,
 	},
 };
 
@@ -1014,7 +1010,7 @@ static int rradc_probe(struct platform_device *pdev)
 	}
 
 	chip->dev = dev;
-	mutex_init(&chip->lock);
+	mutex_init(&chip->conversion_lock);
 
 	ret = device_property_read_u32(dev, "reg", &chip->base);
 	if (ret < 0) {
@@ -1036,9 +1032,7 @@ static int rradc_probe(struct platform_device *pdev)
 	}
 
 	/* Get the PMIC revision ID, we need to handle some varying coefficients */
-	chip->pmic = (struct qcom_spmi_pmic *)spmi_device_get_drvdata(
-		to_spmi_device(pdev->dev.parent));
-	qcom_pmic_print_info(chip->dev, chip->pmic);
+	chip->pmic = qcom_pmic_get(chip->dev);
 
 	indio_dev->name = pdev->name;
 	indio_dev->modes = INDIO_DIRECT_MODE;

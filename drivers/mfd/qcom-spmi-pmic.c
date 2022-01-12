@@ -11,7 +11,7 @@
 #include <linux/spmi.h>
 #include <linux/regmap.h>
 #include <linux/of_platform.h>
-#include <soc/qcom/qcom-pmic.h>
+#include <soc/qcom/qcom-spmi-pmic.h>
 
 #define PMIC_REV2		0x101
 #define PMIC_REV3		0x102
@@ -53,6 +53,52 @@ static const struct of_device_id pmic_spmi_id_table[] = {
 	{ .compatible = "qcom,spmi-pmic", .data = (void *)COMMON_SUBTYPE },
 	{ }
 };
+
+/**
+ * @brief Get a pointer to the PMIC device
+ * 
+ * @param dev the pmic function device
+ * @return const struct qcom_spmi_pmic* 
+ * 
+ * Ref counting is not needed as references will
+ * only be held by drivers below the pmic, they will
+ * always unregister before the pmic does.
+ */
+const struct qcom_spmi_pmic* qcom_pmic_get(struct device *dev)
+{
+	struct qcom_spmi_pmic *pmic;
+	struct spmi_device *sdev;
+	struct regmap *regmap;
+	struct device_node *other_usid;
+	struct platform_device *pdev;
+	int rc;
+
+	if (!of_match_device(pmic_spmi_id_table, dev->parent))
+		return ERR_PTR(-EINVAL);
+
+	sdev = to_spmi_device(dev->parent);
+	if (!sdev)
+		return ERR_PTR(-EINVAL);
+
+	if (sdev->usid % 2 == 0)
+		return spmi_device_get_drvdata(sdev);
+	
+	other_usid = of_get_next_child(sdev->dev.parent->of_node, sdev->dev.of_node);
+	pdev = of_find_device_by_node(other_usid);
+	sdev = to_spmi_device(&pdev->dev);
+
+	if (sdev->usid % 2 == 0)
+		return spmi_device_get_drvdata(sdev);
+	
+	return ERR_PTR(-ENODATA);
+}
+EXPORT_SYMBOL(qcom_pmic_get);
+
+static inline void pmic_print_info(struct device *dev, struct qcom_spmi_pmic *pmic)
+{
+	dev_info(dev, "%x: %s v%d.%d\n",
+		pmic->subtype, pmic->name, pmic->major, pmic->minor);
+}
 
 static int pmic_spmi_load_revid(struct regmap *map, struct device *dev,
 				 struct qcom_spmi_pmic *pmic)
@@ -123,6 +169,7 @@ static int pmic_spmi_probe(struct spmi_device *sdev)
 {
 	struct regmap *regmap;
 	struct qcom_spmi_pmic *pmic;
+	int ret;
 
 	regmap = devm_regmap_init_spmi_ext(sdev, &spmi_regmap_config);
 	if (IS_ERR(regmap))
@@ -134,26 +181,20 @@ static int pmic_spmi_probe(struct spmi_device *sdev)
 
 	/* Only the first slave id for a PMIC contains this information */
 	if (sdev->usid % 2 == 0) {
-		pmic_spmi_load_revid(regmap, &sdev->dev, pmic);
+		ret = pmic_spmi_load_revid(regmap, &sdev->dev, pmic);
+		if (ret < 0)
+			return ret;
 		spmi_device_set_drvdata(sdev, pmic);
-		qcom_pmic_print_info(&sdev->dev, pmic);
+		pmic_print_info(&sdev->dev, pmic);
 	}
 
 	return devm_of_platform_populate(&sdev->dev);
-}
-
-static void pmic_spmi_remove(struct spmi_device *sdev)
-{
-	struct qcom_spmi_pmic *pmic = spmi_device_get_drvdata(sdev);
-
-	kfree(pmic->name);
 }
 
 MODULE_DEVICE_TABLE(of, pmic_spmi_id_table);
 
 static struct spmi_driver pmic_spmi_driver = {
 	.probe = pmic_spmi_probe,
-	.remove = pmic_spmi_remove,
 	.driver = {
 		.name = "pmic-spmi",
 		.of_match_table = pmic_spmi_id_table,
